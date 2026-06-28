@@ -1,6 +1,8 @@
-import { getSandbox } from '@cloudflare/sandbox';
+import { getSandbox, Sandbox as BaseSandbox } from '@cloudflare/sandbox';
 
-export { Sandbox } from '@cloudflare/sandbox';
+export class Sandbox extends BaseSandbox {
+  enableInternet = false;
+}
 
 declare global {
   interface Env {
