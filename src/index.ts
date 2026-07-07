@@ -39,8 +39,10 @@ export default {
       }
 
       try {
-        const sandbox = getSandbox(env.Sandbox, crypto.randomUUID());
-        await sandbox.exec('mkdir -p /work/out');
+        // Stable instance: reuse one warm container (max_instances=1 makes the
+        // single slot serialize instead of starve). Workspace is wiped per run.
+        const sandbox = getSandbox(env.Sandbox, 'cad-exec');
+        await sandbox.exec('rm -rf /work/out /work/script.py && mkdir -p /work/out');
         await sandbox.writeFile('/work/script.py', script);
         const res = await sandbox.exec('python /work/script.py', {
           timeout: Math.min(timeout_ms ?? 60000, 180000)
