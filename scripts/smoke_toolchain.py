@@ -70,13 +70,18 @@ doc.recompute()
 page.exportSvg("{svg_path}")
 print("freecad TechDraw OK")
 """
+    with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
+        f.write(script)
+        fc_path = f.name
+
+    # Debian binary is lowercase `freecadcmd`; run the script as a positional file
+    # (the same invocation the Docker build gate validates).
     result = subprocess.run(
-        ["FreeCADCmd"],
-        input=script,
+        ["freecadcmd", fc_path],
         capture_output=True, text=True, timeout=120,
     )
     if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or "FreeCADCmd non-zero exit")
+        raise RuntimeError(result.stderr.strip() or "freecadcmd non-zero exit")
 
 
 run_step("FreeCAD TechDraw SVG", step_freecad)
