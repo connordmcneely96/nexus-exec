@@ -57,26 +57,22 @@ def step_openscad():
 run_step("OpenSCAD cube→STL", step_openscad)
 
 
-# ── Step 3: FreeCAD TechDraw → PDF ──────────────────────────────────────────
+# ── Step 3: FreeCAD TechDraw → SVG ──────────────────────────────────────────
 def step_freecad():
-    pdf_path = os.path.join(OUT, "techdraw.pdf")
-    script = f"""
-import FreeCAD
+    svg_path = os.path.join(OUT, "techdraw.svg")
+    script = f"""import FreeCAD
 import TechDraw
 doc = FreeCAD.newDocument("smoke")
 page = doc.addObject("TechDraw::DrawPage", "Page")
 template = doc.addObject("TechDraw::DrawSVGTemplate", "Template")
 page.Template = template
 doc.recompute()
-page.exportSvg("{pdf_path.replace('.pdf', '.svg')}")
+page.exportSvg("{svg_path}")
 print("freecad TechDraw OK")
 """
-    with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
-        f.write(script)
-        fc_script = f.name
-
     result = subprocess.run(
-        ["FreeCADCmd", "-c", fc_script],
+        ["FreeCADCmd"],
+        input=script,
         capture_output=True, text=True, timeout=120,
     )
     if result.returncode != 0:

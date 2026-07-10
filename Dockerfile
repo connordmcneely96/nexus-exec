@@ -21,14 +21,13 @@ RUN uv python install 3.12 && uv venv --python 3.12 /opt/venv
 ENV VIRTUAL_ENV="/opt/venv"
 ENV PATH="/opt/venv/bin:${PATH}"
 
-# Install build123d + cadquery via uv (heaviest layers last for cache reuse)
-RUN uv pip install build123d
-RUN uv pip install cadquery
+# Install build123d + cadquery via uv in one solve so OCP version is co-resolved
+RUN uv pip install build123d cadquery
 
 # Warm-import gates — each fails the build if the tool is broken
 RUN python -c "import build123d; print('build123d import OK')"
 RUN openscad --version
 RUN python -c "import cadquery; print('cadquery OK')"
-RUN FreeCADCmd -c "import FreeCAD, TechDraw; print('freecad OK')"
+RUN printf 'import FreeCAD, TechDraw\nprint("freecad OK")\n' | FreeCADCmd 2>&1 | grep -q "freecad OK"
 
 EXPOSE 8080
