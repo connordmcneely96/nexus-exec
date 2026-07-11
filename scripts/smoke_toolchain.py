@@ -57,31 +57,49 @@ def step_openscad():
 run_step("OpenSCAD cube→STL", step_openscad)
 
 
-# ── Step 3: FreeCAD TechDraw → SVG ──────────────────────────────────────────
+# ── Step 3: FreeCAD TechDraw → SVG (per-view export; page-level is Gui-only) ─
 def step_freecad():
     svg_path = os.path.join(OUT, "techdraw.svg")
-    script = f"""import FreeCAD
-import TechDraw
+    # Minimal solid so there is real geometry to export.
+    step_path = os.path.join(OUT, "smoke_box.step")
+    script = f"""import FreeCAD, Part, TechDraw
 doc = FreeCAD.newDocument("smoke")
+# Inline box shape — no dependency on the build123d step completing first.
+box = Part.makeBox(10, 10, 10)
+feat = doc.addObject("Part::Feature", "Model")
+feat.Shape = box
 page = doc.addObject("TechDraw::DrawPage", "Page")
-template = doc.addObject("TechDraw::DrawSVGTemplate", "Template")
-page.Template = template
+view = doc.addObject("TechDraw::DrawViewPart", "ViewFront")
+page.addView(view)
+view.Source = [feat]
+view.Direction = FreeCAD.Vector(0, -1, 0)
+view.Scale = 1.0
 doc.recompute()
-page.exportSvg("{svg_path}")
+svg = TechDraw.viewPartAsSvg(view)
+open("{svg_path}", "w").write(
+    '<svg xmlns="http://www.w3.org/2000/svg" version="1.1">\\n' + svg + '\\n</svg>\\n'
+)
 print("freecad TechDraw OK")
 """
     with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
         f.write(script)
         fc_path = f.name
 
-    # Debian binary is lowercase `freecadcmd`; run the script as a positional file
-    # (the same invocation the Docker build gate validates).
-    result = subprocess.run(
-        ["freecadcmd", fc_path],
-        capture_output=True, text=True, timeout=120,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or "freecadcmd non-zero exit")
+    try:
+        result = subprocess.run(
+            ["freecadcmd", fc_path],
+            capture_output=True, text=True, timeout=120,
+        )
+    finally:
+        os.unlink(fc_path)
+
+    if result.returncode != 0 or "freecad TechDraw OK" not in result.stdout:
+        raise RuntimeError(
+            f"freecadcmd failed (rc={result.returncode}): "
+            + (result.stderr.strip() or result.stdout.strip() or "no output")
+        )
+    assert os.path.exists(svg_path) and os.path.getsize(svg_path) > 0, \
+        f"techdraw.svg missing or empty"
 
 
 run_step("FreeCAD TechDraw SVG", step_freecad)
