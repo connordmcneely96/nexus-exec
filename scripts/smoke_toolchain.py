@@ -60,15 +60,42 @@ run_step("OpenSCAD cube→STL", step_openscad)
 # ── Step 3: FreeCAD TechDraw → SVG (per-view export; page-level is Gui-only) ─
 def step_freecad():
     svg_path = os.path.join(OUT, "techdraw.svg")
-    # Minimal solid so there is real geometry to export.
-    step_path = os.path.join(OUT, "smoke_box.step")
     script = f"""import FreeCAD, Part, TechDraw
+import glob, os
+
+# Locate a TechDraw SVG template (required by FreeCAD 0.19 before projection).
+_dirs = [
+    "/usr/share/freecad/Mod/TechDraw/Templates",
+    "/usr/share/freecad/data/Mod/TechDraw/Templates",
+    "/usr/lib/freecad/Mod/TechDraw/Templates",
+    "/usr/lib/freecad-python3/Mod/TechDraw/Templates",
+]
+_tmpls = []
+for d in _dirs:
+    _tmpls += sorted(glob.glob(os.path.join(d, "*.svg")))
+print("TEMPLATES_FOUND:", _tmpls[:10])
+if not _tmpls:
+    raise RuntimeError("no TechDraw SVG templates found on image")
+
+def _pick(cands):
+    for key in ("A4_Landscape_blank", "A3_Landscape_blank", "A4_Landscape",
+                "A3_Landscape", "Landscape", "blank"):
+        for t in cands:
+            if key.lower() in os.path.basename(t).lower():
+                return t
+    return cands[0]
+
+_tmpl_path = _pick(_tmpls)
+print("TEMPLATE_USED:", _tmpl_path)
+
 doc = FreeCAD.newDocument("smoke")
-# Inline box shape — no dependency on the build123d step completing first.
 box = Part.makeBox(10, 10, 10)
 feat = doc.addObject("Part::Feature", "Model")
 feat.Shape = box
 page = doc.addObject("TechDraw::DrawPage", "Page")
+template = doc.addObject("TechDraw::DrawSVGTemplate", "Template")
+template.Template = _tmpl_path
+page.Template = template
 view = doc.addObject("TechDraw::DrawViewPart", "ViewFront")
 page.addView(view)
 view.Source = [feat]
