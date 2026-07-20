@@ -1,6 +1,8 @@
 FROM docker.io/cloudflare/sandbox:0.12.1
 
-# libGL.so.1 required by cadquery-ocp (OpenCascade); offscreen/GL deps for OpenSCAD/FreeCAD headless
+# libGL.so.1 required by cadquery-ocp (OpenCascade); offscreen/GL deps for OpenSCAD/FreeCAD headless.
+# librsvg2-bin -> rsvg-convert (cairo PDF surface, no Qt, no display); poppler-utils -> pdftoppm/pdftotext;
+# fonts-dejavu-core -> a real font so <text> renders as ink, not tofu.
 RUN apt-get update -qq && apt-get install -y --no-install-recommends \
       libgl1 \
       openscad \
@@ -8,6 +10,9 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends \
       xvfb \
       libxrender1 \
       libxext6 \
+      librsvg2-bin \
+      poppler-utils \
+      fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv
@@ -34,5 +39,22 @@ RUN echo "freecad binaries present:" && (ls /usr/bin/ | grep -i freecad || true)
     printf 'import FreeCAD, TechDraw\nprint("freecad OK")\n' > /tmp/fc_check.py; \
     freecadcmd /tmp/fc_check.py 2>&1 | tee /tmp/fc.log; \
     grep -q "freecad OK" /tmp/fc.log
+
+# PDF render gate: rsvg-convert (SVG->PDF) then pdftoppm (PDF->PGM) must turn a
+# <text font-size='3.5'>30.00</text> plus one <line> into real ink. A blank raster =
+# broken font/toolchain = build fails. grep sets the exit code (fail-closed), matching
+# the FreeCAD gate. The PGM is parsed P5 by a tiny inline python: any pixel below the
+# darkness threshold (200) proves ink landed on the page. The threshold admits the
+# anti-aliased grey glyphs of 3.5-unit text (min value ~128), so the font — not just the
+# line — is proven to render. A blank page yields zero such pixels and fails.
+RUN printf '%s\n' \
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 297">' \
+      '  <line x1="50" y1="150" x2="200" y2="150" stroke="black" stroke-width="0.5"/>' \
+      "  <text x=\"100\" y=\"150\" font-size=\"3.5\" fill=\"black\">30.00</text>" \
+      '</svg>' > /tmp/gate.svg; \
+    rsvg-convert -f pdf -o /tmp/gate.pdf /tmp/gate.svg; \
+    pdftoppm -gray -r 150 /tmp/gate.pdf /tmp/gate; \
+    python3 -c 'import re; d=open("/tmp/gate-1.pgm","rb").read(); m=re.match(rb"P5\s+\d+\s+\d+\s+\d+\s", d); pix=d[m.end():]; dark=sum(b<200 for b in pix); print(("PDF_GATE_OK" if dark>0 else "PDF_GATE_BLANK"), "dark_pixels=%d" % dark)' | tee /tmp/gate.log; \
+    grep -q "PDF_GATE_OK" /tmp/gate.log
 
 EXPOSE 8080
