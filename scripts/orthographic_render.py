@@ -57,12 +57,17 @@ def _geom_type(edge):
 
 
 def _norm_geom(gt):
-    u = gt.upper()
-    if "CIRC" in u:
+    # Exact terminal-token match, NOT substring. "LINE" is a substring of BSPLINE /
+    # SPLINE / POLYLINE, so a substring test mis-classifies those as LINE and lets them
+    # slip past edge_to_svg's STOP-never-fake guard. Take the token after the last '.'
+    # ("GeomType.BSPLINE" -> "BSPLINE") and match it exactly; anything that is not
+    # LINE/CIRCLE returns raw so edge_to_svg's `raise ValueError` fires.
+    token = gt.rsplit(".", 1)[-1].strip().upper()
+    if token == "CIRCLE":
         return "CIRCLE"
-    if "LINE" in u:
+    if token == "LINE":
         return "LINE"
-    return u
+    return token
 
 
 def _fmt(v):
@@ -97,7 +102,14 @@ def _arc_flags(sx, sy, ex, ey, cx, cy, mx, my):
     else:
         ccw, swept = False, two - d_e
     large = 1 if swept > math.pi else 0
-    sweep = 1 if ccw else 0           # y-flip turns model-CCW into screen-CW
+    # y-flip INVERTS the traversal sense: a model-CCW arc, with y negated onto the sheet,
+    # is drawn clockwise (SVG sweep=1 = increasing-angle = clockwise in y-down). So the
+    # SVG sweep flag is the OPPOSITE of the model ccw sense. The prior `1 if ccw else 0`
+    # was inverted — it drew the rim bulging the wrong way (its endpoints still sat at
+    # radius 12, so the radius-only readback in orthographic_render never caught it; the
+    # arc-aware multiview alignment readback is what exposed it, verified by rendering:
+    # sweep=1 gives the true 198..222mm disk, sweep=0 bulges to 245mm).
+    sweep = 0 if ccw else 1
     return large, sweep
 
 
@@ -132,13 +144,20 @@ def edge_to_svg(edge, to_sheet):
                      % gt)
 
 
+def view_path_d(edges, to_sheet):
+    """The 'd' attribute for one view: each edge's exact command, space-joined. Exposed so
+    the multiview composer can place several views (each with its own transform) into ONE
+    sheet without duplicating emission logic."""
+    return " ".join(edge_to_svg(e, to_sheet) for e in edges)
+
+
 def emit_view_svg(edges, to_sheet, sheet=SHEET):
     """Full A3-landscape <svg>, one <path> concatenating each edge's exact command."""
-    d = " ".join(edge_to_svg(e, to_sheet) for e in edges)
     return ('<svg xmlns="http://www.w3.org/2000/svg" version="1.1" '
             'width="%dmm" height="%dmm" viewBox="0 0 %d %d">\n'
             '<path d="%s" fill="none" stroke="black" stroke-width="0.35"/>\n'
-            '</svg>\n' % (sheet["w"], sheet["h"], sheet["w"], sheet["h"], d))
+            '</svg>\n' % (sheet["w"], sheet["h"], sheet["w"], sheet["h"],
+                          view_path_d(edges, to_sheet)))
 
 
 def parse_svg_extremes(svg_text, sheet=SHEET):
@@ -152,29 +171,124 @@ def parse_svg_extremes(svg_text, sheet=SHEET):
     section_render identity-round-trip debt.
     """
     cx, cy = sheet["cx"], sheet["cy"]
+    parts = [parse_path_extremes(d, cx, cy)
+             for d in re.findall(r'\bd\s*=\s*"([^"]*)"', svg_text)]
+    parts = [p for p in parts if p["endpoint_count"] > 0]
+    if not parts:
+        return {"min_radius": None, "max_radius": None, "arc_radii": [],
+                "min_x": None, "max_x": None, "endpoint_count": 0}
+    return {
+        "min_radius": min(p["min_radius"] for p in parts),
+        "max_radius": max(p["max_radius"] for p in parts),
+        "arc_radii": [a for p in parts for a in p["arc_radii"]],
+        "min_x": min(p["min_x"] for p in parts),
+        "max_x": max(p["max_x"] for p in parts),
+        "endpoint_count": sum(p["endpoint_count"] for p in parts),
+    }
 
+
+def _arc_extreme_points(x0, y0, x1, y1, rx, ry, large, sweep):
+    """SVG elliptical-arc (x-axis-rotation 0) -> the two endpoints PLUS the arc's
+    axis-extreme points (cardinal parameter angles) that fall within the swept range.
+    Endpoints alone under-measure a major arc: the rim's leftmost point (-12,0) is arc
+    INTERIOR, not an endpoint, so a purely endpoint readback would miss the true X bound
+    and break the multiview alignment check. Recovers the centre from the emitted string
+    (SVG 1.1 Appendix F.6.5/F.6.6) — no source knowledge."""
+    pts = [(x0, y0), (x1, y1)]
+    if rx <= 0 or ry <= 0:
+        return pts
+    x1p = (x0 - x1) / 2.0
+    y1p = (y0 - y1) / 2.0
+    lam = (x1p * x1p) / (rx * rx) + (y1p * y1p) / (ry * ry)
+    if lam > 1.0:
+        s = math.sqrt(lam)
+        rx *= s
+        ry *= s
+    num = rx * rx * ry * ry - rx * rx * y1p * y1p - ry * ry * x1p * x1p
+    den = rx * rx * y1p * y1p + ry * ry * x1p * x1p
+    coef = 0.0 if den == 0 else math.sqrt(max(0.0, num / den))
+    if large == sweep:
+        coef = -coef
+    cxp = coef * (rx * y1p / ry)
+    cyp = coef * (-(ry * x1p / rx))
+    cx_a = cxp + (x0 + x1) / 2.0
+    cy_a = cyp + (y0 + y1) / 2.0
+
+    def _angle(ux, uy, vx, vy):
+        ln = math.hypot(ux, uy) * math.hypot(vx, vy)
+        c = 1.0 if ln == 0 else max(-1.0, min(1.0, (ux * vx + uy * vy) / ln))
+        a = math.acos(c)
+        return -a if (ux * vy - uy * vx) < 0 else a
+
+    ux0, uy0 = (x1p - cxp) / rx, (y1p - cyp) / ry
+    ux1, uy1 = (-x1p - cxp) / rx, (-y1p - cyp) / ry
+    theta0 = _angle(1.0, 0.0, ux0, uy0)
+    dtheta = _angle(ux0, uy0, ux1, uy1)
+    if not sweep and dtheta > 0:
+        dtheta -= 2.0 * math.pi
+    elif sweep and dtheta < 0:
+        dtheta += 2.0 * math.pi
+    lo, hi = min(theta0, theta0 + dtheta), max(theta0, theta0 + dtheta)
+    for k in range(-4, 5):                       # cardinal params 0, +/-pi/2, +/-pi, ...
+        cand = (math.pi / 2.0) * k
+        if lo - 1e-12 <= cand <= hi + 1e-12:
+            pts.append((cx_a + rx * math.cos(cand), cy_a + ry * math.sin(cand)))
+    return pts
+
+
+def parse_path_extremes(d, cx, cy):
+    """Parse ONE path 'd' string against a (cx, cy) sheet transform. Returns model-space
+    extremes: min/max radius (about the view's model origin), the emitted arc radii, and
+    min/max X. Arcs are measured at their true extent (endpoints + in-sweep cardinal
+    points), not endpoints alone. Exposed so the composer reads back each view separately
+    under that view's own transform. Reads only the string + (cx, cy) — shares no variable
+    with the emit path.
+
+    Generalisation note (multiview slice): added X-extent (min_x/max_x) + arc-aware extent
+    and split per-path parsing out of parse_svg_extremes, which now aggregates over paths.
+    Backward compatible — original keys (min_radius/max_radius/arc_radii/endpoint_count)
+    unchanged (arc-aware points are all on the true geometry, so radii extremes are
+    identical)."""
     def to_model_r(sx, sy):
         return math.hypot(sx - cx, cy - sy)
 
-    num = r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?"
-    endpoint_radii = []
+    numre = r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?"
+    radii = []
     arc_radii = []
-    for d in re.findall(r'\bd\s*=\s*"([^"]*)"', svg_text):
-        for letter, argstr in re.findall(r'([MLAZmlaz])([^MLAZmlaz]*)', d):
-            nums = [float(x) for x in re.findall(num, argstr)]
-            u = letter.upper()
-            if u in ("M", "L"):
-                for k in range(0, len(nums) - 1, 2):
-                    endpoint_radii.append(to_model_r(nums[k], nums[k + 1]))
-            elif u == "A":
-                for k in range(0, len(nums) - 6, 7):
-                    arc_radii.append(nums[k])                       # rx (1:1 == model r)
-                    endpoint_radii.append(to_model_r(nums[k + 5], nums[k + 6]))
+    xs = []
+
+    def add(sx, sy):
+        radii.append(to_model_r(sx, sy))
+        xs.append(sx - cx)
+
+    cur = None
+    for letter, argstr in re.findall(r'([MLAZmlaz])([^MLAZmlaz]*)', d):
+        nums = [float(x) for x in re.findall(numre, argstr)]
+        u = letter.upper()
+        if u in ("M", "L"):
+            for k in range(0, len(nums) - 1, 2):
+                cur = (nums[k], nums[k + 1])
+                add(*cur)
+        elif u == "A":
+            for k in range(0, len(nums) - 6, 7):
+                rx, ry = nums[k], nums[k + 1]
+                large, sweep = int(round(nums[k + 3])), int(round(nums[k + 4]))
+                end = (nums[k + 5], nums[k + 6])
+                arc_radii.append(rx)                            # rx (1:1 == model r)
+                if cur is not None:
+                    for (px, py) in _arc_extreme_points(cur[0], cur[1], end[0], end[1],
+                                                        rx, ry, large, sweep):
+                        add(px, py)
+                else:
+                    add(*end)
+                cur = end
     return {
-        "min_radius": min(endpoint_radii) if endpoint_radii else None,
-        "max_radius": max(endpoint_radii) if endpoint_radii else None,
+        "min_radius": min(radii) if radii else None,
+        "max_radius": max(radii) if radii else None,
         "arc_radii": arc_radii,
-        "endpoint_count": len(endpoint_radii),
+        "min_x": min(xs) if xs else None,
+        "max_x": max(xs) if xs else None,
+        "endpoint_count": len(radii),
     }
 
 
@@ -279,6 +393,23 @@ def _main():
     if abs(pw - A3_W_PT) > PAGE_TOL or abs(ph - A3_H_PT) > PAGE_TOL:
         fail("PAGE_PT %.2f x %.2f not A3 landscape %.2f x %.2f (+/-%.1f)"
              % (pw, ph, A3_W_PT, A3_H_PT, PAGE_TOL))
+
+    # NEGATIVE TEST — the reason commit 1 exists. A non-LINE/CIRCLE edge MUST make
+    # edge_to_svg raise, never silently emit. Before the _norm_geom fix, "LINE" was a
+    # substring of "BSPLINE" so a spline was mis-classified as LINE and drawn straight,
+    # defeating the STOP-never-fake guard. Build a real spline edge and prove it raises.
+    from build123d import Spline
+    neg_edges = list(Spline([(0, 0, 0), (5, 5, 0), (10, -3, 0), (15, 4, 0)]).edges())
+    if not neg_edges:
+        fail("could not construct a spline edge for the negative test")
+    neg_edge = neg_edges[0]
+    print("NEG_TEST_EDGE_GEOM:", _norm_geom(_geom_type(neg_edge)))
+    try:
+        edge_to_svg(neg_edge, to_sheet)
+        fail("edge_to_svg emitted a non-LINE/CIRCLE edge instead of raising "
+             "(STOP-guard defeated)")
+    except ValueError:
+        print("NEG_TEST_BSPLINE: raised as expected.")
 
     print("value_summary: edges=%d types=%s arc_r=%s rendered_r=[%r,%r] page=%s"
           % (OBS["VISIBLE_EDGES"], sorted(geom_types), parsed["arc_radii"],
