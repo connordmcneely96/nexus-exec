@@ -29,6 +29,13 @@ import sys
 
 from build123d import Box, Cylinder, Pos
 
+# OCP is always present (build123d is OCP-backed). Used only by the BSPLINE branch of
+# edge_to_svg to recover the exact spline geometry (ported from spline_emit_proof.py).
+from OCP.BRep import BRep_Tool
+from OCP.BRepAdaptor import BRepAdaptor_Curve
+from OCP.Geom import Geom_BSplineCurve, Geom_TrimmedCurve
+from OCP.GeomConvert import GeomConvert_BSplineCurveToBezierCurve
+
 # ── sheet: A3 landscape, physical mm; model origin -> sheet centre, 1:1, y-flip ──
 SHEET = {"w": 420, "h": 297, "cx": 210.0, "cy": 148.5}
 A3_W_PT = 420.0 / 25.4 * 72.0   # 1190.551
@@ -121,18 +128,151 @@ def project_view(part, view_name):
     return list(res[0]), list(res[1])
 
 
-def edge_to_svg(edge, to_sheet):
-    """Exact geometry, NO discretisation. LINE -> 'M..L..'; CIRCLE -> 'M..A..'.
-    Raises if a CIRCLE lacks radius/arc_center accessors — the producer STOPS rather than
-    fall back to sampling (rule 2)."""
+# ── OCP B-spline helpers — ported verbatim from spline_emit_proof.py (proven green:
+#    SAMPLE_MAX_DELTA 4.59e-11 vs OCP Value(t)). Do not re-derive. ────────────────
+def _downcast(cls, handle):
+    for name in ("DownCast", "DownCast_s"):
+        f = getattr(cls, name, None)
+        if f is None:
+            continue
+        try:
+            r = f(handle)
+            if r is not None:
+                return r
+        except Exception:
+            continue
+    return None
+
+
+def _curve_and_range(topo_edge):
+    """(Geom_Curve, first, last). OCP wraps the Standard_Real& outputs into the return
+    tuple; some builds keep them as inputs — try both, guarded."""
+    for call in (lambda: BRep_Tool.Curve_s(topo_edge, 0.0, 1.0),
+                 lambda: BRep_Tool.Curve_s(topo_edge)):
+        try:
+            r = call()
+        except Exception:
+            continue
+        if isinstance(r, tuple):
+            if len(r) >= 3:
+                return r[0], float(r[1]), float(r[2])
+            if r:
+                return r[0], None, None
+        elif r is not None:
+            return r, None, None
+    return None, None, None
+
+
+def _bspline_of(edge):
+    """Recover the underlying Geom_BSplineCurve of a BSPLINE edge + its trim range."""
+    curve, first, last = _curve_and_range(edge.wrapped)
+    if curve is not None:
+        tc = _downcast(Geom_TrimmedCurve, curve)
+        if tc is not None:
+            if first is None:
+                try:
+                    first, last = float(tc.FirstParameter()), float(tc.LastParameter())
+                except Exception:
+                    pass
+            curve = tc.BasisCurve()
+        bs = _downcast(Geom_BSplineCurve, curve)
+        if bs is not None:
+            if first is None or last is None:
+                first, last = float(bs.FirstParameter()), float(bs.LastParameter())
+            return bs, first, last
+    try:                                     # fallback: BRepAdaptor route
+        ad = BRepAdaptor_Curve(edge.wrapped)
+        bs = ad.BSpline()
+        if bs is not None:
+            return bs, float(ad.FirstParameter()), float(ad.LastParameter())
+    except Exception as e:
+        print("BSPLINE_FALLBACK_ERR:", repr(e))
+    return None, None, None
+
+
+def _pole_xy(bez, j):
+    """Pole j of a Bezier arc, in the view plane. Same convention _xy uses for LINE/CIRCLE
+    endpoints: the flattened frame's in-plane axes are (.X, .Y) (the third is ~0)."""
+    p = bez.Pole(j)
+    return (float(p.X()), float(p.Y()))
+
+
+def _elevate_to_cubic(poles):
+    """Exact degree elevation to cubic (4 control points). poles: list of 2D tuples."""
+    n = len(poles)
+    if n == 4:
+        return [tuple(p) for p in poles]
+    if n == 3:
+        p0, p1, p2 = poles
+        return [tuple(p0),
+                (p0[0] / 3 + 2 * p1[0] / 3, p0[1] / 3 + 2 * p1[1] / 3),
+                (2 * p1[0] / 3 + p2[0] / 3, 2 * p1[1] / 3 + p2[1] / 3),
+                tuple(p2)]
+    if n == 2:
+        p0, p1 = poles
+        dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+        return [tuple(p0),
+                (p0[0] + dx / 3, p0[1] + dy / 3),
+                (p0[0] + 2 * dx / 3, p0[1] + 2 * dy / 3),
+                tuple(p1)]
+    raise ValueError("bezier arc has %d poles (degree %d > 3)" % (n, n - 1))
+
+
+def _bspline_bezier_arcs(edge):
+    """Recover a BSPLINE edge as (arcs, is_rational, max_degree). Raises if the spline
+    cannot be recovered. arcs are Geom_BezierCurve segments over the edge's trim range."""
+    bs, first, last = _bspline_of(edge)
+    if bs is None:
+        raise ValueError("BSPLINE edge: could not recover Geom_BSplineCurve")
+    rational = bool(bs.IsRational())
+    try:
+        conv = GeomConvert_BSplineCurveToBezierCurve(bs, first, last, 1e-9)
+    except Exception:
+        conv = GeomConvert_BSplineCurveToBezierCurve(bs)
+    arcs = [conv.Arc(i) for i in range(1, int(conv.NbArcs()) + 1)]
+    for b in arcs:
+        rational = rational or bool(b.IsRational())
+    max_deg = max((int(b.Degree()) for b in arcs), default=0)
+    return arcs, rational, max_deg
+
+
+def edge_emit_mode(edge):
+    """The mode edge_to_svg will use: 'line' | 'arc' | 'polyline' | 'cubic'. Raises on the
+    same STOP conditions as edge_to_svg (unsupported type, rational spline, degree>3), so a
+    caller can classify/observe without disagreeing with what edge_to_svg does."""
     gt = _norm_geom(_geom_type(edge))
-    p0 = _xy(edge @ 0.0)
-    p1 = _xy(edge @ 1.0)
-    s0 = to_sheet(*p0)
-    s1 = to_sheet(*p1)
     if gt == "LINE":
+        return "line"
+    if gt == "CIRCLE":
+        return "arc"
+    if gt == "BSPLINE":
+        _arcs, rational, max_deg = _bspline_bezier_arcs(edge)
+        if rational or max_deg > 3:
+            raise ValueError("BSPLINE edge is rational=%s / max_degree=%d — Option-2 case; "
+                             "STOP" % (rational, max_deg))
+        return "polyline" if max_deg == 1 else "cubic"
+    raise ValueError("unsupported geom_type %r (no discretization fallback in producer)"
+                     % gt)
+
+
+def edge_to_svg(edge, to_sheet):
+    """Exact geometry, NO chord discretisation. LINE -> 'M..L..'; CIRCLE -> 'M..A..';
+    non-rational BSPLINE (degree <= 3) -> its exact Bezier arcs: degree-1 as a polyline of
+    'L' segments (a degree-1 spline IS a polyline — emit one, keeping the path data honest
+    about a straight edge wearing a BSPLINE tag), degree 2/3 as cubic 'C' arcs via exact
+    degree elevation (the spline_emit_proof path).
+    Raises -> the producer STOPS (never fakes): a CIRCLE lacking radius/arc_center, a
+    RATIONAL spline, or any arc degree > 3 (the Option-2 case, not yet decided)."""
+    gt = _norm_geom(_geom_type(edge))
+    if gt == "LINE":
+        s0 = to_sheet(*_xy(edge @ 0.0))
+        s1 = to_sheet(*_xy(edge @ 1.0))
         return "M %s %s L %s %s" % (_fmt(s0[0]), _fmt(s0[1]), _fmt(s1[0]), _fmt(s1[1]))
     if gt == "CIRCLE":
+        p0 = _xy(edge @ 0.0)
+        p1 = _xy(edge @ 1.0)
+        s0 = to_sheet(*p0)
+        s1 = to_sheet(*p1)
         r = float(edge.radius)              # raises -> producer STOPS (no fallback)
         c = _xy(edge.arc_center)            # raises -> producer STOPS
         mid = _xy(edge @ 0.5)
@@ -140,6 +280,33 @@ def edge_to_svg(edge, to_sheet):
         return ("M %s %s A %s %s 0 %d %d %s %s"
                 % (_fmt(s0[0]), _fmt(s0[1]), _fmt(r), _fmt(r), large, sweep,
                    _fmt(s1[0]), _fmt(s1[1])))
+    if gt == "BSPLINE":
+        arcs, rational, max_deg = _bspline_bezier_arcs(edge)
+        if rational or max_deg > 3:
+            raise ValueError("BSPLINE edge is rational=%s / max_degree=%d — exact "
+                             "non-rational cubic cannot represent it (Option-2 case); STOP"
+                             % (rational, max_deg))
+        parts = None
+        if max_deg == 1:                     # polyline: pole sequence IS the vertex chain
+            for b in arcs:
+                s0 = to_sheet(*_pole_xy(b, 1))
+                s1 = to_sheet(*_pole_xy(b, 2))
+                if parts is None:
+                    parts = ["M %s %s" % (_fmt(s0[0]), _fmt(s0[1]))]
+                parts.append("L %s %s" % (_fmt(s1[0]), _fmt(s1[1])))
+        else:                                # degree 2/3 -> one cubic C per arc
+            for b in arcs:
+                poles = [_pole_xy(b, j) for j in range(1, int(b.NbPoles()) + 1)]
+                cubic = _elevate_to_cubic(poles)
+                s = [to_sheet(*cp) for cp in cubic]
+                if parts is None:
+                    parts = ["M %s %s" % (_fmt(s[0][0]), _fmt(s[0][1]))]
+                parts.append("C %s %s %s %s %s %s"
+                             % (_fmt(s[1][0]), _fmt(s[1][1]), _fmt(s[2][0]), _fmt(s[2][1]),
+                                _fmt(s[3][0]), _fmt(s[3][1])))
+        if not parts:
+            raise ValueError("BSPLINE edge produced no Bezier arcs")
+        return " ".join(parts)
     raise ValueError("unsupported geom_type %r (no discretization fallback in producer)"
                      % gt)
 
@@ -324,12 +491,12 @@ def _main():
     print("VISIBLE_EDGES:", len(visible))
     print("GEOM_TYPES:", geom_types)
 
-    # Step 3: emit exact SVG; EMIT_MODE exact per edge, or FAIL naming the edge.
+    # Step 3: emit each edge; report its EMIT_MODE (line|arc|polyline|cubic), or FAIL.
     to_sheet = make_transform(SHEET)
     for i, e in enumerate(visible):
         try:
             edge_to_svg(e, to_sheet)
-            print("EMIT_MODE[%d] type=%s: exact" % (i, geom_types[i]))
+            print("EMIT_MODE[%d] type=%s: %s" % (i, geom_types[i], edge_emit_mode(e)))
         except Exception as ex:
             OBS["EMIT_FAIL_EDGE"] = i
             fail("edge %d (%s) not exactly emittable: %r" % (i, geom_types[i], ex))
@@ -394,22 +561,59 @@ def _main():
         fail("PAGE_PT %.2f x %.2f not A3 landscape %.2f x %.2f (+/-%.1f)"
              % (pw, ph, A3_W_PT, A3_H_PT, PAGE_TOL))
 
-    # NEGATIVE TEST — the reason commit 1 exists. A non-LINE/CIRCLE edge MUST make
-    # edge_to_svg raise, never silently emit. Before the _norm_geom fix, "LINE" was a
-    # substring of "BSPLINE" so a spline was mis-classified as LINE and drawn straight,
-    # defeating the STOP-never-fake guard. Build a real spline edge and prove it raises.
+    # POSITIVE — a non-rational degree-3 spline now EMITS exact cubics (no raise). This is
+    # the capability this slice folds in; the old test (which asserted a plain Spline RAISED)
+    # is now wrong because such a spline emits.
     from build123d import Spline
-    neg_edges = list(Spline([(0, 0, 0), (5, 5, 0), (10, -3, 0), (15, 4, 0)]).edges())
-    if not neg_edges:
-        fail("could not construct a spline edge for the negative test")
-    neg_edge = neg_edges[0]
-    print("NEG_TEST_EDGE_GEOM:", _norm_geom(_geom_type(neg_edge)))
+    pos_edges = list(Spline([(0, 0, 0), (5, 5, 0), (10, -3, 0), (15, 4, 0)]).edges())
+    if not pos_edges:
+        fail("could not construct a spline edge for the positive test")
+    pos_edge = pos_edges[0]
+    print("POS_TEST_EDGE_GEOM:", _norm_geom(_geom_type(pos_edge)),
+          "mode:", edge_emit_mode(pos_edge))
+    pos_path = edge_to_svg(pos_edge, to_sheet)
+    if "C " not in pos_path:
+        fail("degree-3 spline did not emit a cubic 'C' path: %r" % pos_path[:80])
+    print("NEG_TEST_CUBIC_EMITS: degree-3 spline emitted cubic C without raising.")
+
+    # NEGATIVE — the STOP guard must still fire. Build a RATIONAL bspline edge (non-uniform
+    # weights) and assert edge_to_svg raises. If it cannot be built, report SKIPPED — never
+    # fake it, never delete the guard.
     try:
-        edge_to_svg(neg_edge, to_sheet)
-        fail("edge_to_svg emitted a non-LINE/CIRCLE edge instead of raising "
-             "(STOP-guard defeated)")
-    except ValueError:
-        print("NEG_TEST_BSPLINE: raised as expected.")
+        from build123d import Edge
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
+        from OCP.gp import gp_Pnt
+        from OCP.TColgp import TColgp_Array1OfPnt
+        from OCP.TColStd import TColStd_Array1OfInteger, TColStd_Array1OfReal
+
+        poles = TColgp_Array1OfPnt(1, 4)
+        for j, (px, py, pz) in enumerate([(0, 0, 0), (5, 8, 0), (10, -8, 0), (15, 0, 0)], 1):
+            poles.SetValue(j, gp_Pnt(float(px), float(py), float(pz)))
+        weights = TColStd_Array1OfReal(1, 4)          # non-uniform -> RATIONAL
+        for j, w in enumerate([1.0, 2.5, 0.5, 1.0], 1):
+            weights.SetValue(j, w)
+        knots = TColStd_Array1OfReal(1, 2)
+        knots.SetValue(1, 0.0)
+        knots.SetValue(2, 1.0)
+        mults = TColStd_Array1OfInteger(1, 2)
+        mults.SetValue(1, 4)
+        mults.SetValue(2, 4)
+        rbs = Geom_BSplineCurve(poles, weights, knots, mults, 3)
+        rat_edge = Edge(BRepBuilderAPI_MakeEdge(rbs).Edge())
+        built = True
+    except Exception as ex:
+        built = False
+        print("NEG_TEST_SKIPPED: could not construct a rational bspline edge: %r" % ex)
+
+    if built:
+        print("NEG_TEST_RATIONAL_GEOM:", _norm_geom(_geom_type(rat_edge)),
+              "IsRational:", bool(rbs.IsRational()))
+        try:
+            edge_to_svg(rat_edge, to_sheet)
+            fail("edge_to_svg emitted a RATIONAL bspline instead of raising "
+                 "(STOP-guard defeated)")
+        except ValueError:
+            print("NEG_TEST_RATIONAL_STOPS: rational bspline raised as expected.")
 
     print("value_summary: edges=%d types=%s arc_r=%s rendered_r=[%r,%r] page=%s"
           % (OBS["VISIBLE_EDGES"], sorted(geom_types), parsed["arc_radii"],
