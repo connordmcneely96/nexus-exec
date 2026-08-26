@@ -29,6 +29,7 @@ from orthographic_render import (
     PAGE_TOL,
     _geom_type,
     _norm_geom,
+    edge_emit_mode,
     make_transform,
     parse_path_extremes,
     project_view,
@@ -74,15 +75,23 @@ def _main():
         print("%s_GEOM_TYPES: %s" % (name, gts))
         views[name] = (vis, gts)
 
-    # ── the live coverage question — FRONT must stay LINE/CIRCLE, else STOP+FAIL LOUD ──
+    # ── FRONT now emits: edge_to_svg handles degree-1 BSPLINE (as L segments), so the
+    #    old FRONT_HAS_NONLINEAR abort is gone. Every FRONT edge must be one the producer
+    #    can emit (LINE / CIRCLE / non-rational BSPLINE deg<=3). A RATIONAL or degree>3
+    #    spline STILL fails loud — the genuine Option-2 case, not worked around. ──
     front_vis, front_gts = views["FRONT"]
-    nonlinear = [g for g in front_gts if g not in ("LINE", "CIRCLE")]
-    if nonlinear:
-        OBS["FRONT_HAS_NONLINEAR"] = nonlinear
-        print("FRONT_HAS_NONLINEAR:", nonlinear)
-        fail("FRONT projects non-LINE/CIRCLE edge type(s) %s — the producer STOPs on "
-             "these (correct). FRONT is outside the exact-edge producer's coverage; "
-             "not working around it." % nonlinear)
+    front_modes = []
+    for i, e in enumerate(front_vis):
+        try:
+            front_modes.append(edge_emit_mode(e))
+        except Exception as ex:
+            OBS["FRONT_UNEMITTABLE"] = "edge %d (%s): %r" % (i, front_gts[i], ex)
+            print("FRONT_UNEMITTABLE:", OBS["FRONT_UNEMITTABLE"])
+            fail("FRONT edge %d (%s) is not exact-emittable (rational spline or degree>3) "
+                 "— the genuine Option-2 case, not worked around: %r"
+                 % (i, front_gts[i], ex))
+    OBS["FRONT_EMIT_MODES"] = front_modes
+    print("FRONT_EMIT_MODES:", front_modes)
 
     # ── Step 3: SHARED transform — same CX + scale, only CY differs ──────────
     top_tf = make_transform({"cx": CX, "cy": CY_TOP})
@@ -93,8 +102,21 @@ def _main():
         top_d = view_path_d(views["TOP"][0], top_tf)
         front_d = view_path_d(front_vis, front_tf)
     except Exception as e:
-        fail("edge_to_svg STOPped during emission (a supposedly LINE/CIRCLE edge lacked "
-             "exact accessors): %r" % e)
+        fail("edge_to_svg STOPped during emission: %r" % e)
+
+    # CONFIRM the readback covers every command the emitted SVG contains. FRONT's degree-1
+    # splines emit as L, so the existing M/L/A parse_path_extremes covers them (%.10f emits
+    # no letters, so any letter here is a path command). A 'C' would need cubic-parse support
+    # — not added here (untested) — before a curved part could compose; fail loud if it ever
+    # appears rather than silently mis-reading it.
+    cmds = set(re.findall(r"[A-Za-z]", top_d + " " + front_d))
+    OBS["PATH_COMMANDS"] = "".join(sorted(cmds))
+    print("PATH_COMMANDS:", OBS["PATH_COMMANDS"])
+    unsupported = cmds - set("MLAZmlaz")
+    if unsupported:
+        fail("emitted SVG contains path command(s) %s that parse_path_extremes does not "
+             "handle (e.g. 'C' cubic). A curved part needs C-parse support before it can "
+             "compose; not adding untested C-parsing now." % sorted(unsupported))
 
     svg = ('<svg xmlns="http://www.w3.org/2000/svg" version="1.1" '
            'width="%dmm" height="%dmm" viewBox="0 0 %d %d">\n'
